@@ -1,5 +1,7 @@
 import os
 
+import pytest
+
 from malduck import Yara, YaraString
 from malduck.procmem import Region, ProcessMemory
 
@@ -64,6 +66,79 @@ def test_yara_dirs_and_files():
 
     match = inner_rules.match(filepath=os.path.join(local_path, "dummy.dmp"))
     assert not match
+
+
+def test_yara_dir_name_collision(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "rule.yar").write_text(
+        'rule First { strings: $a = "first" condition: $a }'
+    )
+    (tmp_path / "sub" / "rule.yar").write_text(
+        'rule Second { strings: $a = "second" condition: $a }'
+    )
+
+    # Same-named rules from different files must fail closed
+    # instead of silently overriding the namespace
+    with pytest.raises(ValueError):
+        Yara.from_dir(str(tmp_path))
+
+    # Removing the collision makes the ruleset loadable again
+    (tmp_path / "sub" / "rule.yar").unlink()
+    ruleset = Yara.from_dir(str(tmp_path))
+    match = ruleset.match(data=b"first second")
+    assert "First" in match
+
+
+def test_yara_dir_link_outside_root(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "evil.yar").write_text("rule Evil { condition: true }")
+    root = tmp_path / "root"
+    root.mkdir()
+    os.symlink(str(outside / "evil.yar"), str(root / "evil.yar"))
+
+    # Links resolving outside of the rule root must fail closed
+    with pytest.raises(ValueError):
+        Yara.from_dir(str(root))
+
+
+def test_yara_dir_links_inside_root(tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    real_rule = sub / "real_rule.yar"
+    real_rule.write_text(
+        'rule RealRule { strings: $a = "malduck" condition: $a }'
+    )
+    os.symlink(str(real_rule), str(tmp_path / "linked_rule.yar"))
+
+    # Explicit links staying inside the rule root keep working and
+    # the same file reached through different links shares one identity
+    ruleset = Yara.from_dir(str(tmp_path))
+    match = ruleset.match(data=b"malduck")
+    assert match
+    assert "RealRule" in match
+
+    # Reloading the same directory gives the same namespaces
+    reloaded = Yara.from_dir(str(tmp_path))
+    assert reloaded.match(data=b"malduck")
+
+
+def test_yara_dir_nested_rules(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "outer.yar").write_text(
+        'rule Outer { strings: $a = "outer" condition: $a }'
+    )
+    (tmp_path / "sub" / "inner.yar").write_text(
+        'rule Inner { strings: $a = "inner" condition: $a }'
+    )
+
+    all_rules = Yara.from_dir(str(tmp_path))
+    match = all_rules.match(data=b"outer inner")
+    assert sorted(match.keys()) == ["Inner", "Outer"]
+
+    inner_rules = Yara.from_dir(str(tmp_path), recursive=False)
+    match = inner_rules.match(data=b"outer inner")
+    assert sorted(match.keys()) == ["Outer"]
 
 
 def test_procmem_yara():

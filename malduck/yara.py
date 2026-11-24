@@ -147,27 +147,56 @@ class Yara:
         """
         Find rules (recursively) in specified path. Supported extensions: \\*.yar, \\*.yara
 
+        Rule namespace is derived from the file name, so each rule file needs to have
+        an unique name within the scanned tree. Rule files are identified by their
+        canonical (symlink-resolved) path, which is shared by the rule root,
+        the namespace and the paths used for compilation:
+
+        * the same file reached through different links is registered only once,
+        * a rule file resolving outside of the rule root raises an error,
+        * different rule files colliding on the same namespace raise an error
+          instead of silently overriding each other.
+
         :param path: Root path for searching
         :type path: str
         :param recursive: Search recursively (default: enabled)
         :type recursive: bool
         :param followlinks: Follow symbolic links (default: enabled)
         :type followlinks: bool
+        :raises ValueError: On rule name collision or a rule resolving
+                            outside of the rule root
         :rtype: :class:`Yara`
         """
         rule_paths: Dict[str, str] = {}
+        root_path = os.path.realpath(path)
+        seen_paths = set()
         for root, _, files in os.walk(path, followlinks=followlinks):
             for fname in files:
                 if not fname.endswith(".yar") and not fname.endswith(".yara"):
                     continue
                 ruleset_name = os.path.splitext(os.path.basename(fname))[0]
                 ruleset_path = os.path.join(root, fname)
-                if ruleset_name in rule_paths:
-                    log.warning(
-                        f"Yara file name collision - {rule_paths[ruleset_name]} "
-                        f"overridden by {ruleset_path}"
+                real_path = os.path.realpath(ruleset_path)
+                try:
+                    in_root = os.path.commonpath([root_path, real_path]) == root_path
+                except ValueError:
+                    # Paths can't be compared (e.g. different drives on Windows)
+                    in_root = False
+                if not in_root:
+                    raise ValueError(
+                        f"Yara rule {ruleset_path} resolves outside of "
+                        f"the rule root {root_path}"
                     )
-                rule_paths[ruleset_name] = ruleset_path
+                if real_path in seen_paths:
+                    # Same file reached through a different link
+                    continue
+                if ruleset_name in rule_paths:
+                    raise ValueError(
+                        f"Yara file name collision - {rule_paths[ruleset_name]} "
+                        f"and {ruleset_path}"
+                    )
+                seen_paths.add(real_path)
+                rule_paths[ruleset_name] = real_path
             if not recursive:
                 break
         return Yara(rule_paths=rule_paths)
