@@ -6,7 +6,7 @@ from ..disasm import disasm
 from ..string.bin import int8, int16, int32, int64, uint8, uint16, uint32, uint64
 from ..string.ops import utf16z
 from ..yara import Yara, YaraString
-from .region import PAGE_EXECUTE_READWRITE, Region
+from .region import MAX_ADDRESS, PAGE_EXECUTE_READWRITE, MemoryRangeError, Region
 
 __all__ = ["ProcessMemory", "procmem"]
 
@@ -227,6 +227,97 @@ class ProcessMemory:
         else:
             return 0
 
+    @staticmethod
+    def _check_address(name, value):
+        """Validate a virtual address or a physical buffer offset."""
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("{} must be an integer".format(name))
+        if value < 0:
+            raise MemoryRangeError("{} can't be negative".format(name))
+        if value >= MAX_ADDRESS:
+            raise MemoryRangeError(
+                "{} is outside of the supported address space".format(name)
+            )
+        return value
+
+    @classmethod
+    def _check_range(cls, addr, length, name="address"):
+        """
+        Validate a range and return its exclusive end.
+
+        A ``None`` length means an open-ended range.  Address arithmetic is
+        performed only after this check, so a malicious dump can't make a
+        query wrap around the end of the address space.
+        """
+        if addr is not None:
+            cls._check_address(name, addr)
+        if length is None:
+            return None
+        if not isinstance(length, int) or isinstance(length, bool):
+            raise TypeError("length must be an integer")
+        if length < 0:
+            raise MemoryRangeError("Length can't be less than 0")
+        end = addr + length if addr is not None else length
+        if end > MAX_ADDRESS:
+            raise MemoryRangeError("Requested range overflows the address space")
+        return end
+
+    def _ordered_regions(self, by_offset=False):
+        """
+        Returns regions in deterministic order and rejects overlapping
+        virtual mappings.
+
+        Region metadata comes from the (possibly malicious) dump, so it must
+        be validated before it can be used for address translation, reads or
+        writes.  Gaps are legal, virtual overlaps are not: two regions
+        claiming the same virtual address would make the selected region
+        depend on iteration order.
+        """
+        by_addr = sorted(self.regions, key=lambda region: (region.addr, region.offset))
+        mapped = [region for region in by_addr if region.size > 0]
+        for previous, current in zip(mapped, mapped[1:]):
+            if current.addr < previous.end:
+                raise MemoryRangeError(
+                    "Overlapping memory regions: 0x{:x}-0x{:x} and "
+                    "0x{:x}-0x{:x}".format(
+                        previous.addr,
+                        previous.end,
+                        current.addr,
+                        current.end,
+                    )
+                )
+        if by_offset:
+            return sorted(self.regions, key=lambda region: (region.offset, region.addr))
+        return by_addr
+
+    def _read_region(self, region):
+        """
+        Reads exactly one trimmed region from its physical mapping.
+
+        A short physical read means that the region metadata doesn't match
+        the dump contents.  Returning that short buffer would silently turn a
+        truncated/malicious region into valid-looking data for the caller.
+        """
+        if region.offset < 0 or region.offset + region.size > MAX_ADDRESS:
+            raise MemoryRangeError(
+                "Region 0x{:x}-0x{:x} has an invalid physical range".format(
+                    region.addr, region.end
+                )
+            )
+        data = self.readp(region.offset, region.size)
+        if len(data) != region.size:
+            raise MemoryRangeError(
+                "Short read for region 0x{:x}-0x{:x}: expected {} bytes at "
+                "offset 0x{:x}, got {}".format(
+                    region.addr,
+                    region.end,
+                    region.size,
+                    region.offset,
+                    len(data),
+                )
+            )
+        return data
+
     def iter_regions(
         self, addr=None, offset=None, length=None, contiguous=False, trim=False
     ):
@@ -253,6 +344,10 @@ class ProcessMemory:
         :param trim: Trim Region objects to range boundaries (addr, addr+length)
         :type trim: bool (default: False)
         :rtype: Iterator[:class:`Region`]
+
+        :raises MemoryRangeError: If the query is negative/overflows the
+                                  address space or the region map contains
+                                  overlapping virtual ranges
         """
         if addr is not None and offset is not None:
             raise ValueError(
@@ -262,17 +357,27 @@ class ProcessMemory:
             raise ValueError(
                 "Starting point (addr or offset) must be provided for contiguous regions"
             )
-        if length and length < 0:
-            raise ValueError("Length can't be less than 0")
+        if addr is not None:
+            self._check_range(addr, length, "addr")
+        if offset is not None:
+            self._check_range(offset, length, "offset")
+        elif length is not None and length < 0:
+            raise MemoryRangeError("Length can't be less than 0")
         # No length, no problem
         if length == 0:
+            return
+        # Regions are validated (including virtual overlap detection) before
+        # any query is answered, so mapping, reads and writes share the same
+        # view of the dump.
+        regions = self._ordered_regions(by_offset=offset is not None)
+        if not regions:
             return
         # If we don't have starting point provided: first region is the
         # starting point
         if addr is None and offset is None:
-            addr = self.regions[0].addr
+            addr = regions[0].addr
         # Skipping regions before starting point
-        for region_idx, region in enumerate(self.regions):
+        for region_idx, region in enumerate(regions):
             if (addr is not None and addr < region.end) or (
                 offset is not None and offset < region.end_offset
             ):
@@ -310,7 +415,11 @@ class ProcessMemory:
             addr = region.p2v(offset)
         # Continue enumeration
         prev_region = None
-        for region in self.regions[region_idx:]:
+        for region in regions[region_idx:]:
+            # A zero-sized region maps no bytes; it can't satisfy a read and
+            # must not stop enumeration of later regions.
+            if region.size == 0:
+                continue
             intersection = region.trim_range(addr, length)
             # If we've got empty intersection: time to break
             if not intersection:
@@ -335,17 +444,22 @@ class ProcessMemory:
         """
         if addr is None:
             return None
+        self._check_range(addr, length, "addr")
         mapping_length = 0
         for region in self.iter_regions(
             addr=addr, length=length, contiguous=True, trim=True
         ):
+            physical_offset = region.v2p(addr)
+            if not (0 <= physical_offset < self.length):
+                return None
             if length is None:
-                return region.v2p(addr)
+                return physical_offset
             mapping_length += region.size
             if mapping_length >= length:
-                return region.v2p(addr)
-        else:
-            return None
+                if physical_offset + length > self.length:
+                    return None
+                return physical_offset
+        return None
 
     def p2v(self, off, length=None):
         """
@@ -361,17 +475,21 @@ class ProcessMemory:
         """
         if off is None:
             return None
+        self._check_range(off, length, "offset")
         mapping_length = 0
         for region in self.iter_regions(
             offset=off, length=length, contiguous=True, trim=True
         ):
+            if off >= self.length:
+                return None
             if length is None:
                 return region.p2v(off)
             mapping_length += region.size
             if mapping_length >= length:
+                if off + length > self.length:
+                    return None
                 return region.p2v(off)
-        else:
-            return None
+        return None
 
     def is_addr(self, addr):
         """
@@ -437,7 +555,7 @@ class ProcessMemory:
                     yield current_addr, b"".join(current_strings)
                 current_addr = region.addr
                 current_strings = []
-            current_strings.append(self.readp(region.offset, region.size))
+            current_strings.append(self._read_region(region))
             prev_region = region
         if current_strings:
             yield current_addr, b"".join(current_strings)
@@ -452,9 +570,17 @@ class ProcessMemory:
         :type length: int
         :return: Chunk from specified location
         :rtype: bytes
+
+        A malformed region whose declared size is not backed by the memory
+        buffer raises :class:`MemoryRangeError` instead of silently returning
+        a short buffer.  Reading across a gap keeps the legacy behavior and
+        returns the contiguous prefix.
         """
-        if length is not None and length <= 0:
+        if length is not None and length < 0:
+            raise MemoryRangeError("Length can't be less than 0")
+        if length == 0:
             return b""
+        self._check_range(addr, length, "addr")
         _, chunk = next(self.readv_regions(addr, length), (0, b""))
         return chunk
 
@@ -515,18 +641,37 @@ class ProcessMemory:
 
         Patched address range must be within single region, ValueError is raised otherwise.
 
+        An empty buffer is a no-op.  The complete range is validated (address
+        overflow, region membership and physical buffer bounds) before any
+        byte is written.
+
         :param addr: Virtual address
         :type addr: int
         :param buf: Buffer with patch to apply
         :type buf: bytes
         """
-        region = self.addr_region(addr)
-        # Boundary check
-        if region is None or region.end < (addr + len(buf)):
+        length = len(buf)
+        # A zero-length write has no target range, just like readv(addr, 0).
+        if length == 0:
+            return None
+        end = self._check_range(addr, length, "addr")
+        regions = list(
+            self.iter_regions(addr=addr, length=length, contiguous=True, trim=True)
+        )
+        # The same trimmed range used for reads must be fully contained in
+        # exactly one region.  Checking only addr + len(buf) against region.end
+        # would accept negative/overflowing ends and writes crossing a region
+        # boundary.
+        if len(regions) != 1 or regions[0].addr != addr or regions[0].end != end:
             raise ValueError(
                 "Patched bytes range must be contained within single, existing region"
             )
-        return self.patchp(region.v2p(addr), buf)
+        region = regions[0]
+        if region.offset < 0 or region.offset + length > self.length:
+            raise MemoryRangeError(
+                "Patched bytes range is not fully backed by memory buffer"
+            )
+        return self.patchp(region.offset, buf)
 
     def uint8p(self, offset, fixed=False):
         """Read unsigned 8-bit value at offset."""

@@ -37,6 +37,7 @@ from .ints import (
 )
 from .pe import pe
 from .procmem import (
+    MAX_ADDRESS,
     PAGE_EXECUTE,
     PAGE_EXECUTE_READ,
     PAGE_EXECUTE_READWRITE,
@@ -44,6 +45,7 @@ from .procmem import (
     PAGE_READONLY,
     PAGE_READWRITE,
     PAGE_WRITECOPY,
+    MemoryRangeError,
     cuckoomem,
     idamem,
     procmem,
@@ -178,6 +180,8 @@ __all__ = [
     "PAGE_EXECUTE_READ",
     "PAGE_EXECUTE_READWRITE",
     "PAGE_EXECUTE_WRITECOPY",
+    "MemoryRangeError",
+    "MAX_ADDRESS",
     # string
     "uint64",
     "uint32",

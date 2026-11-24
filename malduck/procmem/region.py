@@ -5,6 +5,8 @@ from typing import Dict, Optional, Union
 
 __all__ = [
     "Region",
+    "MemoryRangeError",
+    "MAX_ADDRESS",
     "PAGE_READONLY",
     "PAGE_READWRITE",
     "PAGE_WRITECOPY",
@@ -21,6 +23,16 @@ PAGE_EXECUTE = 0x00000010
 PAGE_EXECUTE_READ = 0x00000020
 PAGE_EXECUTE_READWRITE = 0x00000040
 PAGE_EXECUTE_WRITECOPY = 0x00000080
+
+# Virtual addresses are unsigned 64-bit values.  Keep one exclusive upper
+# bound in a single place so every range calculation (regions, queries and
+# physical offsets) is checked against the same address space.
+MAX_ADDRESS = 1 << 64
+
+
+class MemoryRangeError(ValueError):
+    """Raised when a memory range is invalid, overflows or cannot be mapped."""
+
 
 page_access = {
     PAGE_READONLY: "r",
@@ -39,6 +51,18 @@ class Region:
     def __init__(
         self, addr: int, size: int, state: int, type_: int, protect: int, offset: int
     ) -> None:
+        if addr < 0 or addr >= MAX_ADDRESS:
+            raise MemoryRangeError("Region address is outside of the address space")
+        if size < 0:
+            raise MemoryRangeError("Region size can't be negative")
+        if offset < 0 or offset >= MAX_ADDRESS:
+            raise MemoryRangeError("Region offset is outside of the address space")
+        if addr + size > MAX_ADDRESS:
+            raise MemoryRangeError(
+                "Region virtual range overflows the address space"
+            )
+        if offset + size > MAX_ADDRESS:
+            raise MemoryRangeError("Region physical range overflows the address space")
         self.addr = addr
         self.size = size
         self.state = state
@@ -129,6 +153,13 @@ class Region:
         :param length: Length of range (optional)
         :rtype: :class:`Region`
         """
+        if addr < 0 or addr >= MAX_ADDRESS:
+            raise MemoryRangeError("Address is outside of the address space")
+        if length is not None:
+            if length < 0:
+                raise MemoryRangeError("Length can't be less than 0")
+            if addr + length > MAX_ADDRESS:
+                raise MemoryRangeError("Requested range overflows the address space")
         new_addr = max(self.addr, addr)
         new_end = min(self.end, addr + length) if length is not None else self.end
         if new_end <= new_addr:

@@ -5,6 +5,7 @@ from .procmemdnpe import ProcessMemoryDnPE, procmemdnpe
 from .procmemelf import ProcessMemoryELF, procmemelf
 from .procmempe import ProcessMemoryPE, procmempe
 from .region import (
+    MAX_ADDRESS,
     PAGE_EXECUTE,
     PAGE_EXECUTE_READ,
     PAGE_EXECUTE_READWRITE,
@@ -12,6 +13,7 @@ from .region import (
     PAGE_READONLY,
     PAGE_READWRITE,
     PAGE_WRITECOPY,
+    MemoryRangeError,
     Region,
 )
 
@@ -30,6 +32,8 @@ __all__ = [
     "IDAProcessMemory",
     "idamem",
     "Region",
+    "MemoryRangeError",
+    "MAX_ADDRESS",
     "PAGE_READONLY",
     "PAGE_READWRITE",
     "PAGE_WRITECOPY",
