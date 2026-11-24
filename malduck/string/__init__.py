@@ -45,6 +45,12 @@ from .bin import (
 )
 from .inet import ipv4
 from .ops import (
+    DecodedString,
+    StringDecodeResult,
+    ULEB128_MAX_BYTES,
+    ULEB128_MAX_LENGTH,
+    StringResult,
+    ULEB128Result,
     asciiz,
     base64,
     chunks,
@@ -108,6 +114,12 @@ __all__ = [
     "chunks_iter",
     "chunks",
     "utf16z",
+    "StringResult",
+    "DecodedString",
+    "StringDecodeResult",
+    "ULEB128Result",
+    "ULEB128_MAX_BYTES",
+    "ULEB128_MAX_LENGTH",
     "enhex",
     "unhex",
     "uleb128",

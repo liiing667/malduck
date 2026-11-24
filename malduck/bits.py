@@ -18,9 +18,16 @@ def rol(value: int, count: int, bits: int = 32) -> int:
        :py:meth:`malduck.ints.IntType.rol`
 
     """
-    count = (bits - 1) & count
-    value = (value << count) | ((2**count - 1) & (value >> (bits - count)))
-    return value % 2**bits
+    if not isinstance(bits, int) or isinstance(bits, bool):
+        raise TypeError("bits must be an integer")
+    if bits <= 0:
+        raise ValueError("bits must be greater than 0")
+    count %= bits
+    mask = (1 << bits) - 1
+    value &= mask
+    if count == 0:
+        return value
+    return ((value << count) | (value >> (bits - count))) & mask
 
 
 def ror(value: int, count: int, bits: int = 32) -> int:
@@ -36,13 +43,17 @@ def ror(value: int, count: int, bits: int = 32) -> int:
        :py:meth:`malduck.ints.IntType.ror`
 
     """
-    return rol(value, bits - count, bits)
+    return rol(value, -count, bits)
 
 
 def align(value: int, round_to: int) -> int:
     """
     Rounds value up to provided alignment
     """
+    if not isinstance(round_to, int) or isinstance(round_to, bool):
+        raise TypeError("round_to must be an integer")
+    if round_to <= 0:
+        raise ValueError("round_to must be greater than 0")
     return ((value - 1) // round_to + 1) * round_to
 
 
@@ -50,4 +61,8 @@ def align_down(value: int, round_to: int) -> int:
     """
     Rounds value down to provided alignment
     """
+    if not isinstance(round_to, int) or isinstance(round_to, bool):
+        raise TypeError("round_to must be an integer")
+    if round_to <= 0:
+        raise ValueError("round_to must be greater than 0")
     return (value // round_to) * round_to

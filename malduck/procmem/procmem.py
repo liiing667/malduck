@@ -4,7 +4,7 @@ from typing import BinaryIO, List, Optional, Union, cast
 
 from ..disasm import disasm
 from ..string.bin import int8, int16, int32, int64, uint8, uint16, uint32, uint64
-from ..string.ops import utf16z
+from ..string.ops import asciiz, utf16z
 from ..yara import Yara, YaraString
 from .region import PAGE_EXECUTE_READWRITE, Region
 
@@ -594,7 +594,8 @@ class ProcessMemory:
 
     def asciiz(self, addr):
         """Read a null-terminated ASCII string at address."""
-        return self.readv_until(addr, b"\x00")
+        _, chunk = next(self.readv_regions(addr), (0, b""))
+        return asciiz(chunk).with_offset(addr)
 
     def utf16z(self, addr):
         """
@@ -603,14 +604,19 @@ class ProcessMemory:
         :param addr: Virtual address of string
         :rtype: bytes
         """
-        buf = self.readv_until(addr, b"\x00\x00")
-        """
-        Can't use \x00\x00\x00 here because string can be just empty
-        We just need to read one more byte in case string length is not even
-        """
-        if len(buf) % 2:
-            buf += self.readv(addr + len(buf), 1)
-        return utf16z(buf + b"\x00\x00")
+        # A raw b"\x00\x00" search can match across two code units (for
+        # example the high byte of one character and the low byte of the
+        # next), which would shift the decoded range.  Accept only an
+        # aligned terminator.  If the mapped range ends first, utf16z()
+        # reports the unterminated state instead of us fabricating a
+        # terminator from the end of the region.
+        buf = self.readv(addr)
+        idx = buf.find(b"\x00\x00")
+        while idx >= 0 and idx % 2:
+            idx = buf.find(b"\x00\x00", idx + 1)
+        if idx >= 0:
+            return utf16z(buf[: idx + 2]).with_offset(addr)
+        return utf16z(buf).with_offset(addr)
 
     def _find(self, buf, query, offset=None, length=None):
         offset = offset or 0
