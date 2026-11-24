@@ -6,6 +6,9 @@ Approximately 20 times faster than other Python implementations.
 Compatible with both Python 2 and 3.
 """
 from io import BytesIO
+from typing import Optional
+
+from ..transaction import BoundedOutput, DEFAULT_OUTPUT_LIMIT, DecompressionError
 
 __all__ = ["APLib"]
 __version__ = "0.6"
@@ -16,9 +19,17 @@ class APLib(object):
 
     __slots__ = "source", "destination", "tag", "bitcount", "strict"
 
-    def __init__(self, source: bytes, strict: bool = True) -> None:
+    def __init__(
+        self,
+        source: bytes,
+        strict: bool = True,
+        destination: Optional[BoundedOutput] = None,
+    ) -> None:
         self.source = BytesIO(source)
-        self.destination = bytearray()
+        self.destination = (
+            destination if destination is not None
+            else BoundedOutput(DEFAULT_OUTPUT_LIMIT)
+        )
         self.tag = 0
         self.bitcount = 0
         self.strict = bool(strict)
@@ -56,7 +67,7 @@ class APLib(object):
         try:
 
             # first byte verbatim
-            self.destination += self.source.read(1)
+            self.destination.write(self.source.read(1))
 
             # main decompression loop
             while not done:
@@ -68,7 +79,9 @@ class APLib(object):
                                 offs = (offs << 1) + self.getbit()
 
                             if offs:
-                                self.destination.append(self.destination[-offs])
+                                self.destination.append(
+                                    self.destination.byte_at(offs)
+                                )
                             else:
                                 self.destination.append(0)
 
@@ -80,7 +93,9 @@ class APLib(object):
 
                             if offs:
                                 for _ in range(length):
-                                    self.destination.append(self.destination[-offs])
+                                    self.destination.append(
+                                        self.destination.byte_at(offs)
+                                    )
                             else:
                                 done = True
 
@@ -94,7 +109,9 @@ class APLib(object):
                             length = self.getgamma()
 
                             for _ in range(length):
-                                self.destination.append(self.destination[-offs])
+                                self.destination.append(
+                                    self.destination.byte_at(offs)
+                                )
                         else:
                             if lwm == 0:
                                 offs -= 3
@@ -113,20 +130,26 @@ class APLib(object):
                                 length += 2
 
                             for _ in range(length):
-                                self.destination.append(self.destination[-offs])
+                                self.destination.append(
+                                    self.destination.byte_at(offs)
+                                )
 
                             r0 = offs
 
                         lwm = 1
                 else:
-                    self.destination += self.source.read(1)
+                    self.destination.write(self.source.read(1))
                     lwm = 0
 
+        except DecompressionError:
+            # Output budget exhausted (or an invalid back-reference): the
+            # transaction owns the cleanup, just keep the error type.
+            raise
         except (TypeError, IndexError):
             if self.strict:
                 raise RuntimeError("aPLib decompression error")
 
-        return bytes(self.destination)
+        return self.destination.getvalue()
 
     def pack(self):
         raise NotImplementedError

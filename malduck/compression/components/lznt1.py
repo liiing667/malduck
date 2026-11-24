@@ -29,7 +29,13 @@ https://github.com/sleuthkit/sleuthkit/blob/develop/tsk/fs/ntfs.c
 """
 import array
 import struct
-from io import BytesIO
+from typing import Optional
+
+from ..transaction import (
+    DEFAULT_OUTPUT_LIMIT,
+    DecompressionError,
+    DecompressionTransaction,
+)
 
 __all__ = ["decompress_data"]
 
@@ -52,65 +58,115 @@ SIZE_MASK = (1 << 12) - 1
 TAG_MASKS = [(1 << i) for i in range(0, 8)]
 
 
-def decompress_data(cdata: bytes) -> bytes:
-    """Decompresses the data."""
+def decompress_data(
+    cdata: bytes, output_limit: Optional[int] = DEFAULT_OUTPUT_LIMIT
+) -> bytes:
+    """Decompresses the data.
 
-    in_fd = BytesIO(cdata)
-    output_fd = BytesIO()
-    block_end = 0
+    The whole operation runs inside a :class:`DecompressionTransaction`:
+    every control (block) header is validated against the remaining input,
+    every emitted byte (including bytes produced by a back-reference) is
+    charged against the shared output budget and any failure discards the
+    partially decompressed buffer.
 
-    while in_fd.tell() < len(cdata):
-        block_offset = in_fd.tell()
-        uncompressed_chunk_offset = output_fd.tell()
+    :param cdata: LZNT1 compressed buffer
+    :type cdata: bytes
+    :param output_limit: Maximum decompressed size in bytes
+    :type output_limit: int, optional
+    :rtype: bytes
+    """
+    if not isinstance(cdata, (bytes, bytearray, memoryview)):
+        raise TypeError("Compressed data must be a bytes-like object")
+    cdata = bytes(cdata)
 
-        block_header = struct.unpack("<H", in_fd.read(2))[0]
+    with DecompressionTransaction(output_limit) as output_fd:
+        offset = 0
 
-        if block_header & SIGNATURE_MASK != SIGNATURE_MASK:
-            break
+        while offset < len(cdata):
+            uncompressed_chunk_offset = len(output_fd)
 
-        size = block_header & SIZE_MASK
+            # A block header always consumes two bytes.
+            if offset + 2 > len(cdata):
+                raise DecompressionError(
+                    "Truncated LZNT1 block header at offset %d" % offset
+                )
 
-        block_end = block_offset + size + 3
+            block_header = struct.unpack_from("<H", cdata, offset)[0]
 
-        if block_header & COMPRESSED_MASK:
-            while in_fd.tell() < block_end:
-                header = ord(in_fd.read(1))
+            if block_header & SIGNATURE_MASK != SIGNATURE_MASK:
+                # End of the LZNT1 stream: the remaining bytes are padding.
+                break
 
-                for mask in TAG_MASKS:
-                    if in_fd.tell() >= block_end:
-                        break
+            size = block_header & SIZE_MASK
+            block_end = offset + size + 3
 
-                    if header & mask:
-                        pointer = struct.unpack("<H", in_fd.read(2))[0]
-                        displacement = DISPLACEMENT_TABLE[
-                            output_fd.tell() - uncompressed_chunk_offset - 1
-                        ]
+            # A declared block must be fully contained in the input.
+            if block_end > len(cdata):
+                raise DecompressionError(
+                    "LZNT1 block at offset %d declares %d bytes but only %d "
+                    "remain" % (offset, block_end - offset, len(cdata) - offset)
+                )
 
-                        symbol_offset = (pointer >> (12 - displacement)) + 1
-                        symbol_length = (pointer & (0xFFF >> displacement)) + 3
+            data_offset = offset + 2
 
-                        output_fd.seek(-symbol_offset, 2)
-                        data = output_fd.read(symbol_length)
+            if block_header & COMPRESSED_MASK:
+                while data_offset < block_end:
+                    header = cdata[data_offset]
+                    data_offset += 1
 
-                        # Pad the data to make it fit.
-                        if 0 < len(data) < symbol_length:
-                            data = data * (symbol_length // len(data) + 1)
-                            data = data[:symbol_length]
+                    for mask in TAG_MASKS:
+                        if data_offset >= block_end:
+                            break
 
-                        output_fd.seek(0, 2)
+                        if header & mask:
+                            if data_offset + 2 > block_end:
+                                raise DecompressionError(
+                                    "Truncated LZNT1 back-reference at "
+                                    "offset %d" % data_offset
+                                )
+                            pointer = struct.unpack_from(
+                                "<H", cdata, data_offset
+                            )[0]
+                            data_offset += 2
 
-                        output_fd.write(data)
+                            chunk_position = (
+                                len(output_fd) - uncompressed_chunk_offset - 1
+                            )
+                            if not 0 <= chunk_position < len(DISPLACEMENT_TABLE):
+                                raise DecompressionError(
+                                    "LZNT1 chunk grew beyond the supported "
+                                    "window of %d bytes"
+                                    % len(DISPLACEMENT_TABLE)
+                                )
+                            displacement = DISPLACEMENT_TABLE[
+                                chunk_position
+                            ]
 
-                    else:
-                        data = in_fd.read(1)
+                            symbol_offset = (
+                                pointer >> (12 - displacement)
+                            ) + 1
+                            symbol_length = (
+                                pointer & (0xFFF >> displacement)
+                            ) + 3
 
-                        output_fd.write(data)
+                            # Copy byte by byte so overlapping references
+                            # (the classic RLE expansion trick used by
+                            # decompression bombs) are charged one byte at a
+                            # time against the output budget. byte_at()
+                            # validates that the reference points at already
+                            # produced data.
+                            for _ in range(symbol_length):
+                                output_fd.append(
+                                    output_fd.byte_at(symbol_offset)
+                                )
 
-        else:
-            # Block is not compressed
-            data = in_fd.read(size + 1)
-            output_fd.write(data)
+                        else:
+                            output_fd.append(cdata[data_offset])
+                            data_offset += 1
+            else:
+                # Block is not compressed: exactly size + 1 literal bytes.
+                output_fd.write(cdata[data_offset:block_end])
 
-    result = output_fd.getvalue()
+            offset = block_end
 
-    return result
+        return output_fd.getvalue()
