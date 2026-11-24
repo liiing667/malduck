@@ -69,26 +69,54 @@ class ProcessMemoryBinary(ProcessMemory, metaclass=ABCMeta):
         raise NotImplementedError()
 
     @classmethod
-    def load_binaries_from_memory(cls: Type[T], procmem: ProcessMemory) -> Iterator[T]:
+    def load_binaries_from_memory(
+        cls: Type[T], procmem: ProcessMemory, limit: Optional[int] = None
+    ) -> Iterator[T]:
         """
         Looks for binaries in ProcessMemory object and yields specialized ProcessMemoryBinary objects
         :param procmem: ProcessMemory object to search
+        :param limit: Maximum number of binaries (counting both memory-dump
+            and loader-image mappings) yielded from this ProcessMemory.
+            Remaining magic signatures are not even looked at, so fake MZ/ELF
+            headers can't force an unbounded number of full binary loads.
+            ``None`` means no limit.
 
         .. versionchanged:: 4.4.0
 
             In addition to image=False binaries, it also returns image=True versions.
             In previous versions it was done by extractor, so it was working only
             if memory-aligned version was also "valid".
+
+        .. versionchanged:: 4.5.0
+
+            Added ``limit`` parameter bounding the carving budget.
         """
         if cls.__magic__ is None:
             raise NotImplementedError()
+        if limit is not None and limit <= 0:
+            return
+        yielded = 0
         for binary_va in procmem.findv(cls.__magic__):
+            if limit is not None and yielded >= limit:
+                log.warning(
+                    "Reached the limit of %d carved %s binaries, "
+                    "remaining candidates are skipped",
+                    limit,
+                    cls.__name__,
+                )
+                break
             binary_procmem_dmp = cls.from_memory(procmem, base=binary_va)
             if binary_procmem_dmp.is_valid():
                 yield binary_procmem_dmp
+                yielded += 1
+                if limit is not None and yielded >= limit:
+                    break
             binary_procmem_img = binary_procmem_dmp.image
             if binary_procmem_img and binary_procmem_img.is_valid():
                 yield binary_procmem_img
+                yielded += 1
+                if limit is not None and yielded >= limit:
+                    break
 
     @abstractmethod
     def is_image_loaded_as_memdump(self) -> bool:

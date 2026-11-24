@@ -20,6 +20,14 @@ log = logging.getLogger(__name__)
 
 __all__ = ["ExtractManager"]
 
+#: Maximum number of binaries (including both dump and image mappings) that are
+#: carved from a single ProcessMemory and passed through extraction.
+#:
+#: Dumps containing many fake MZ/ELF signatures, overlapping images or damaged
+#: trailing sections would otherwise force every candidate to be fully loaded,
+#: which may significantly amplify memory and CPU usage.
+MAX_CARVED_BINARIES = 10
+
 
 class ExtractManager:
     """
@@ -118,15 +126,68 @@ class ExtractManager:
         """
         Carves binaries from ProcessMemory to try configuration extraction
         using every possible address mapping.
+
+        Candidates are produced lazily and bounded by
+        :data:`MAX_CARVED_BINARIES` so that a dump full of fake MZ/ELF
+        signatures, overlapping images or corrupted trailing sections can't
+        force an unbounded number of full binary loads. The budget is shared
+        across PE and ELF candidates and enforced at the carve source, so
+        skipped magic signatures are never fully loaded.
         """
+        remaining_budget = MAX_CARVED_BINARIES
         for binclass in self.binary_classes:
-            carved_bins = binclass.load_binaries_from_memory(p)
+            carved_bins = binclass.load_binaries_from_memory(
+                p, limit=remaining_budget
+            )
             for carved_bin in carved_bins:
                 log.debug(
                     f"carve: Found {carved_bin.__class__.__name__} "
                     f"at offset {carved_bin.regions[0].offset}"
                 )
+                remaining_budget -= 1
                 yield carved_bin
+            if remaining_budget <= 0:
+                # Budget exhausted: don't even look at the next binary class.
+                # The source generator already logged a warning in that case.
+                break
+
+    @staticmethod
+    def _remap_matches(
+        matches: YaraRulesetMatch,
+        source: ProcessMemory,
+        destination: ProcessMemory,
+    ) -> YaraRulesetMatch:
+        """
+        Translates YARA matches found on ``source`` ProcessMemory into the
+        address space of ``destination``.
+
+        Carved binaries share the underlying buffer of the original dump but
+        usually expose a different region layout (e.g. an image rebuilt with
+        loader-like section mapping). Reusing the original physical offsets
+        against the carved object's :meth:`p2v` can therefore land on an
+        unrelated virtual address and attribute configuration to the wrong
+        binary.
+
+        The offsets are mapped in two steps:
+
+        1. source physical offset -> source virtual address
+        2. source virtual address -> destination physical offset ->
+           destination virtual address
+
+        Matches that don't belong to the destination's mapped ranges are
+        dropped (the mapper returns ``None``).
+        """
+
+        def map_offset(off: Optional[int], length: Optional[int]) -> Optional[int]:
+            va = source.p2v(off, length)
+            if va is None:
+                return None
+            physical = destination.v2p(va, length)
+            if physical is None:
+                return None
+            return destination.p2v(physical, length)
+
+        return matches.remap(map_offset)
 
     def push_config(self, config: Config) -> bool:
         if not config.get("family"):
@@ -169,12 +230,20 @@ class ExtractManager:
         self.configs[family] = config
         return True
 
-    def _extract_procmem(self, p: ProcessMemory, matches) -> Optional[str]:
+    def _extract_procmem(
+        self,
+        p: ProcessMemory,
+        matches: YaraRulesetMatch,
+        match_source: ProcessMemory,
+    ) -> Optional[str]:
         log.debug("%s - ripping...", repr(p))
         # Create extraction context for single file
         manager = ExtractionContext(parent=self)
-        # Map offset matches to VA using procmem address mapping
-        va_matches = matches.remap(p.p2v)
+        # Map offset matches to VA using the address mapping of the
+        # ProcessMemory the matches actually belong to. Carved binaries need
+        # an explicit source -> destination remap because their region layout
+        # may differ from the original dump.
+        va_matches = self._remap_matches(matches, match_source, p)
         # Push ProcessMemory for extraction with mapped Yara matches
         manager.push_procmem(p, _matches=va_matches)
         # Get final configurations
@@ -209,9 +278,14 @@ class ExtractManager:
 
         binaries = self.carve_procmem(p) if rip_binaries else iter([])
 
-        family = self._extract_procmem(p, matches)
+        # All extraction contexts created in this push share the same YARA
+        # generation: the matches were collected on `p` and are explicitly
+        # remapped into the address space of every carved binary.
+        family = self._extract_procmem(p, matches, match_source=p)
         for binary in binaries:
-            family = self._extract_procmem(binary, matches) or family
+            family = (
+                self._extract_procmem(binary, matches, match_source=p) or family
+            )
         return family
 
     @property
