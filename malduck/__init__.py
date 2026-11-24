@@ -18,7 +18,15 @@ from .crypto import (
     xor,
 )
 from .disasm import disasm, insn
-from .extractor import Extractor
+from .extractor import (
+    ConfigConflict,
+    ConfigConflictError,
+    ConfigConflictType,
+    ConfigLineage,
+    ConflictType,
+    Extractor,
+    FieldVersion,
+)
 from .hash import crc32, md5, sha1, sha224, sha256, sha384, sha512
 from .ints import (
     BYTE,
@@ -139,7 +147,13 @@ __all__ = [
     "disasm",
     "insn",
     # extractor
+    "ConfigConflict",
+    "ConfigConflictError",
+    "ConfigConflictType",
+    "ConfigLineage",
+    "ConflictType",
     "Extractor",
+    "FieldVersion",
     # hash
     "crc32",
     "md5",
