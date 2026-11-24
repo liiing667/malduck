@@ -1,7 +1,7 @@
 from typing import List, Optional
 
 from ..bits import align
-from ..pe import PE
+from ..pe import PE, PELayout
 from .binmem import ProcessMemoryBinary
 from .procmem import ProcessMemoryBuffer
 from .region import Region
@@ -76,26 +76,37 @@ class ProcessMemoryPE(ProcessMemoryBinary):
 
     def _reload_as_image(self) -> None:
         # Load PE data from imgbase offset
-        pe = self._pe_direct_load(fast_load=False)
+        try:
+            pe = self._pe_direct_load(fast_load=True)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(
+                "Inconsistent PE layout: unable to parse PE headers"
+            ) from exc
+        # Validate the file layout before touching the current object.  The
+        # resulting regions, the section table and store() must all describe
+        # the same file.
+        layout = PELayout(pe.pe, data_len=len(pe.data), validate_raw=True)
         # If mmap: close all descriptors or
         # nullify references if mmap is not owned by current object
         self.close()
         # Set memory to the pe.data buffer
         self.memory = bytearray(pe.data)
-        self.imgbase = pe.optional_header.ImageBase
+        self.imgbase = layout.image_base
         # Reset regions
-        self.regions = [Region(self.imgbase, pe.headers_size, 0, 0, 0, 0)]
+        self.regions = [Region(self.imgbase, layout.headers_size, 0, 0, 0, 0)]
         # Load image sections
-        for section in pe.sections:
-            if section.SizeOfRawData > 0:
+        for section in layout.sections:
+            if section.raw_size > 0:
                 self.regions.append(
                     Region(
-                        self.imgbase + section.VirtualAddress,
-                        section.SizeOfRawData,
+                        self.imgbase + section.virtual_address,
+                        section.raw_size,
                         0,
                         0,
                         0,
-                        section.PointerToRawData,
+                        section.raw_offset,
                     )
                 )
 
@@ -156,31 +167,129 @@ class ProcessMemoryPE(ProcessMemoryBinary):
 
         :rtype: bytes
         """
+        if self.is_image:
+            # image=True keeps the original file bytes in memory and maps
+            # sections using their original raw offsets.  Returning that
+            # buffer preserves the exact layout instead of re-laying sections
+            # out according to sizes that may not match the header.
+            return bytes(self.memory)
+        return self._store_from_dump()
+
+    def _load_header_pe(self) -> PE:
+        """Read and parse PE headers using the object's virtual mapping."""
+        offset = self.v2p(self.imgbase)
+        if offset is None:
+            raise ValueError("imgbase out of regions")
+        if offset + 0x40 > len(self.m):
+            raise ValueError("Inconsistent PE layout: truncated DOS header")
+        if self.readp(offset, 2) != self.__magic__:
+            raise ValueError("Inconsistent PE layout: missing MZ magic")
+
+        pe_lfanew = self.uint32p(offset + 0x3C)
+        if pe_lfanew is None or pe_lfanew < 0x40:
+            raise ValueError("Inconsistent PE layout: invalid e_lfanew")
+        file_header_offset = offset + pe_lfanew + 4
+        if file_header_offset + 20 > len(self.m):
+            raise ValueError("Inconsistent PE layout: truncated file header")
+        if self.readp(offset + pe_lfanew, 4) != b"PE\x00\x00":
+            raise ValueError("Inconsistent PE layout: missing PE signature")
+
+        number_of_sections = self.uint16p(file_header_offset + 2)
+        optional_header_size = self.uint16p(file_header_offset + 16)
+        if number_of_sections is None or optional_header_size is None:
+            raise ValueError("Inconsistent PE layout: truncated file header")
+        section_table_end = (
+            pe_lfanew + 24 + optional_header_size + 40 * number_of_sections
+        )
+        header_data = self.readv(self.imgbase, section_table_end)
+        if len(header_data) < section_table_end:
+            raise ValueError("Inconsistent PE layout: truncated section table")
+
+        try:
+            pe = PE(data=bytearray(header_data), fast_load=True)
+        except Exception as exc:
+            raise ValueError(
+                "Inconsistent PE layout: unable to parse PE headers"
+            ) from exc
+        headers_size = max(
+            section_table_end,
+            int(getattr(pe.optional_header, "SizeOfHeaders", 0) or 0),
+        )
+        if headers_size > len(header_data):
+            header_data = self.readv(self.imgbase, headers_size)
+            if len(header_data) < headers_size:
+                raise ValueError("Inconsistent PE layout: headers extend past input")
+            try:
+                pe = PE(data=bytearray(header_data), fast_load=True)
+            except Exception as exc:
+                raise ValueError(
+                    "Inconsistent PE layout: unable to parse PE headers"
+                ) from exc
+        return pe
+
+    def _store_from_dump(self) -> bytes:
         data = []
-        current_offs = self.pe.headers_size
-        # Read headers (until first section page in raw data)
-        pe = PE(self.readv(self.imgbase, current_offs), fast_load=True)
+        # Read headers without trusting PointerToRawData from the (possibly
+        # damaged) section table.
+        pe = self._load_header_pe()
+        layout = PELayout(pe.pe, data_len=len(pe.data), validate_raw=False)
+        current_offs = layout.headers_size
+
+        if (
+            not 0 <= self.imgbase < layout.address_limit
+            or self.imgbase % 0x10000
+        ):
+            raise ValueError("Cannot store PE: invalid ImageBase")
+        if layout.sections:
+            image_end = layout.sections[-1].virtual_end
+            if self.imgbase + image_end > layout.address_limit:
+                raise ValueError(
+                    "Cannot store PE: ImageBase plus section addresses "
+                    "overflow the address space"
+                )
 
         for idx, section in enumerate(pe.sections):
-            # Find corresponding region
-            section_region = self.addr_region(self.imgbase + section.VirtualAddress)
-            # No corresponding region? BSS.
-            if not section_region:
+            section_layout = layout.sections[idx]
+            section_va = self.imgbase + section_layout.virtual_address
+            if section_va >= layout.address_limit:
+                raise ValueError(
+                    f"Cannot store section {idx} ({section_layout.name!r}): "
+                    "virtual address out of range"
+                )
+            # A section without raw data is BSS.  It has no file content and
+            # must stay that way even if the dump has mapped zero pages for it.
+            if section_layout.is_bss:
                 continue
+
+            # Find corresponding region
+            section_region = self.addr_region(section_va)
+            if not section_region:
+                raise ValueError(
+                    f"Cannot store section {idx} ({section_layout.name!r}): "
+                    "section is not mapped in memory"
+                )
+            # The whole raw payload must be available.  A short read would
+            # otherwise be zero-filled and silently change the section.
+            if self.v2p(section_va, section_layout.raw_size) is None:
+                raise ValueError(
+                    f"Cannot store section {idx} ({section_layout.name!r}): "
+                    "section raw data is not fully mapped in memory"
+                )
+
             # Get possible section size
-            section_size = max(section.Misc_VirtualSize, section.SizeOfRawData)
+            section_size = max(section_layout.virtual_size, section_layout.raw_size)
             # Align to section alignment (usually 0x1000)
             section_alignment = max(0x1000, pe.optional_header.SectionAlignment)
             section_size = align(section_size, section_alignment)
             # Sometimes real region size is less than virtual size (image=True)
-            section_size = min(section_region.size, section_size)
+            section_size = min(
+                section_region.end - section_va, section_size
+            )
             # Align to file alignment (usually 0x200)
             file_alignment = max(0x200, pe.optional_header.FileAlignment)
             section_size = align(section_size, file_alignment)
             # Read section data including appropriate padding
-            section_data = self.readv(
-                self.imgbase + section.VirtualAddress, section_size
-            )
+            section_data = self.readv(section_va, section_size)
             section_data += (section_size - len(section_data)) * b"\x00"
             data.append(section_data)
             # Fix section values
@@ -188,6 +297,7 @@ class ProcessMemoryPE(ProcessMemoryBinary):
             current_offs += section_size
 
         pe.optional_header.ImageBase = self.imgbase
+        pe.optional_header.SizeOfHeaders = layout.headers_size
 
         # Generate header data
         pe_data = b"".join([bytes(pe.pe.write())] + data)
