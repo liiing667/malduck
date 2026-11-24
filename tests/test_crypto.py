@@ -2,6 +2,10 @@
 # This file is part of Roach - https://github.com/jbremer/roach.
 # See the file 'docs/LICENSE.txt' for copying permission.
 
+import hashlib
+
+import pytest
+
 from malduck import (
     aes,
     camellia,
@@ -14,6 +18,7 @@ from malduck import (
     unhex,
     rabbit,
     p8,
+    p32,
     serpent,
     chacha20,
     salsa20,
@@ -292,6 +297,98 @@ SMwUJzX+C1ptwMcRoQIDAQAB
 MB4wDQYJKoZIhvcNAQEBBQADDQAwCgIDAQABAgMBAAE=
 -----END PUBLIC KEY-----
 """.strip()
+
+    # A BLOB is one key identity end-to-end: truncated or inconsistent RSA2
+    # BLOBs must be rejected instead of being half-parsed into a public PEM.
+    private_blob = base64("""
+BwIAAACkAABSU0EyAAQAAAEAAQCxTx++ykWtb2UaYFYQLt1yM893SV/wLehU2DwzeAMpxq5MsOF5
+XVAd1qSElMN8Uqxdn7FXuT4XFJjH2o6MsnkheoWKPmIC357IUk/N/49dyjtk14In+HdxWKKoguXd
+lOfGoriyieo8cr4kYCoYGPpHNv50NlZi3jkzQvW+hVK6v/ufshtYBRd/+NjecYVQlt7ivap8d/9g
+szM+eSC91zZm8OPUCmfQX8AJOq9r7LUB/tS5DLswtJZdDDmpjhbGf/ZDg+YhHFPYvRlnGP4PlXBW
+Qds44ZlSJJ780+tDuxP3Zn1Nfch4IZjkATGx7Zd9tzr8iLDe0zAGzJDaV92qHR7Hn5V5VGH1dZk2
+DMiR1893vJfuE9RwDja6hUycXNjj9Y1fCYGK3rsVGO7+Dg9xab3HFqueydlMgir8MD4jShsaXk2P
+jUYp2KdJuyN6BZP1oorUntgJIJGeoK59w5Vxni64rJp6KKhsKiOWM37cWAVYmd3dc0PeF3R9s/1Y
+nTMtXoo1r77CjBv5q+zvMSzeFUl+ji9beSZbzl9rAvJOBw4v1Bj8EzPq5aYvEs7h9M66BbZjuyeH
+zp2sRBuxE6K13j1AIVHCK7gbVwlieHWKuE5d45ealzSsChwoxGlJcHlHBI62zQqo7SHbb2An72IS
+XtyKY18/3bYV4nv6ydeC9zgpVlNfGwgwP05Rkp7ldJsCz7uT6RAANV86JIp+65SCKs4gcgWWPIbn
+KJ4s7fs/3oy7tUSTdviZShGj2cJGiEIyIiA=
+    """)
+
+    public_blob = base64("""
+BgIAAACkAABSU0ExAAQAAAEAAQChEcfAbVoL/jUnFMxI+xsR0zZUvMZ+9pgkLGpaxTiLRP6PZqx8
+lDdwqdb7gC+m5aOz+Uwms6RHrY/xRMYEXopj877qLancMtsiqcpASOYJWxWSgW+gQMJGldwn2H97
+AaHoqFlbn7NW6oNtpz4C7NotiggtVnqLdE8YyNfO6/gEpQ==
+    """)
+
+    valid_private_pem = rsa.import_key(private_blob)
+    valid_public_pem = rsa.import_key(public_blob)
+
+    # The exported PEMs carry the same modulus identity as the BLOBs.
+    assert valid_private_pem is not None
+    assert valid_public_pem is not None
+
+    # Header/bitsize/components/exported-PEM all share one key identity.
+    from Cryptodome.PublicKey import RSA as _RSA
+
+    private_key = _RSA.import_key(valid_private_pem)
+    public_key = _RSA.import_key(valid_public_pem)
+    # RSA2 BLOB: 8-byte BLOBHEADER + 12-byte RSAPUBKEY, then LE modulus.
+    assert private_key.n == int.from_bytes(private_blob[20:148], "little")
+    assert private_key.e == 65537
+    assert public_key.n == int.from_bytes(public_blob[20:148], "little")
+    # Fingerprint evidence is stable for the fixed control fixtures.
+    assert hashlib.sha256(valid_private_pem).hexdigest() == (
+        hashlib.sha256(rsa.import_key(private_blob)).hexdigest()
+    )
+
+    # Truncation at any boundary (including "public part only") is rejected.
+    for cut in (8, 19, 20, 50, 147, 148, len(private_blob) - 1):
+        assert rsa.import_key(private_blob[:cut]) is None
+    for cut in (20, 50, len(public_blob) - 1):
+        assert rsa.import_key(public_blob[:cut]) is None
+
+    # Abnormal bitsize values cannot produce a misleading component layout.
+    for bad_bitsize in (0, 1, 7, 12, 1023, 1025):
+        malformed = (
+            private_blob[:8]
+            + b"RSA2"
+            + p32(bad_bitsize)
+            + p32(65537)
+            + b"\x01" * 256
+        )
+        assert rsa.import_key(malformed) is None
+
+    # A structurally complete but CRT-inconsistent BLOB is rejected.
+    bits = 1024
+    half, full = bits // 16, bits // 8
+    p = 0xD0F9E6E2D9B04D0E5E9F1C2A3B4D5E6F708192A3B4C5D6E7F8091827364556678899AABBCCDDEEFF0011223344556677889
+    q = 0xC1A2B3C4D5E6F708192A3B4C5D6E7F80918273645566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF1
+    n, e = p * q, 65537
+    d = pow(e, -1, (p - 1) * (q - 1))
+    coeff = pow(q, -1, p)
+
+    def make_blob(crt_value):
+        return (
+            private_blob[:8]
+            + b"RSA2"
+            + p32(bits)
+            + p32(e)
+            + n.to_bytes(full, "little")
+            + p.to_bytes(half, "little")
+            + q.to_bytes(half, "little")
+            + (d % (p - 1)).to_bytes(half, "little")
+            + (d % (q - 1)).to_bytes(half, "little")
+            + crt_value.to_bytes(half, "little")
+            + d.to_bytes(full, "little")
+        )
+
+    assert rsa.import_key(make_blob(coeff)) is not None
+    assert rsa.import_key(make_blob(coeff ^ 0xDEADBEEF)) is None
+
+    # PyCryptodome itself refuses CRT-inconsistent tuples under strict checks,
+    # which is what the hardened RSA2 export path relies on.
+    with pytest.raises(ValueError):
+        _RSA.construct((n, e, d, p, q, coeff ^ 1), consistency_check=True)
 
 
 def test_rabbit():

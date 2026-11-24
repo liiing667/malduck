@@ -23,6 +23,17 @@ class PublicKeyBlob(BaseBlob):
         self.e: Optional[int] = None
         self.n: Optional[int] = None
 
+    @staticmethod
+    def _read_bigint(buf: BytesIO, size: int) -> Optional[int]:
+        """
+        Reads exactly ``size`` bytes from the BLOB and interprets them as a
+        little-endian bigint. Returns None when the BLOB is truncated.
+        """
+        raw = buf.read(size)
+        if len(raw) != size:
+            return None
+        return bigint.unpack(raw)
+
     def parse(self, buf: BytesIO) -> Optional[int]:
         header = buf.read(12)
         if len(header) != 12 or header[:4] != self.magic:
@@ -31,11 +42,17 @@ class PublicKeyBlob(BaseBlob):
         self.bitsize = cast(int, uint32(header[4:8], fixed=False))
         self.e = cast(int, uint32(header[8:12], fixed=False))
 
-        n = buf.read(self.bitsize // 8)
-        if len(n) != self.bitsize // 8:
+        # The component sizes below are derived from the header bitsize.
+        # It has to be a positive multiple of 16 bits, otherwise neither
+        # bitsize / 8 nor bitsize / 16 describes a valid RSA BLOB layout.
+        if self.bitsize <= 0 or self.bitsize % 16:
             return None
 
-        self.n = bigint.unpack(n)
+        n = self._read_bigint(buf, self.bitsize // 8)
+        if n is None:
+            return None
+
+        self.n = n
         return 12 + self.bitsize // 8
 
     def export_key(self) -> bytes:
@@ -56,39 +73,51 @@ class PrivateKeyBlob(PublicKeyBlob):
         self.coeff: Optional[int] = None
         self.d: Optional[int] = None
 
-    def parse(self, buf: BytesIO) -> None:
+    def parse(self, buf: BytesIO) -> Optional[int]:
         off = PublicKeyBlob.parse(self, buf)
-        if not off:
-            return
+        if off is None:
+            return None
 
-        self.p1 = bigint.unpack(buf.read(self.bitsize // 16))
-        if self.p1 is None:
-            return
+        half = self.bitsize // 16
+        # Every private component must be present in full: a truncated RSA2
+        # BLOB must never be silently exported as a half-parsed public key.
+        for name, size in (
+            ("p1", half),
+            ("p2", half),
+            ("exp1", half),
+            ("exp2", half),
+            ("coeff", half),
+            ("d", self.bitsize // 8),
+        ):
+            component = self._read_bigint(buf, size)
+            if component is None:
+                return None
+            setattr(self, name, component)
 
-        self.p2 = bigint.unpack(buf.read(self.bitsize // 16))
-        if self.p2 is None:
-            return
-
-        self.exp1 = bigint.unpack(buf.read(self.bitsize // 16))
-        if self.exp1 is None:
-            return
-
-        self.exp2 = bigint.unpack(buf.read(self.bitsize // 16))
-        if self.exp2 is None:
-            return
-
-        self.coeff = bigint.unpack(buf.read(self.bitsize // 16))
-        if self.coeff is None:
-            return
-
-        self.d = bigint.unpack(buf.read(self.bitsize // 8))
-        if self.d is None:
-            return
+        return off + 5 * half + self.bitsize // 8
 
     def export_key(self) -> bytes:
-        if not (self.e and self.n):
+        # The header, bitsize, modulus and every private component have to
+        # describe one and the same key before a PEM may be produced.
+        components = (
+            self.e,
+            self.n,
+            self.d,
+            self.p1,
+            self.p2,
+            self.coeff,
+        )
+        if not all(components):
             raise ValueError("The imported key is invalid")
-        return RSA.export_key(self.n, self.e, self.d)
+        return RSA.export_key(
+            self.n,
+            self.e,
+            self.d,
+            self.p1,
+            self.p2,
+            self.coeff,
+            consistency_check=True,
+        )
 
 
 BlobTypes = {
@@ -112,7 +141,7 @@ class RSA:
         """
         try:
             return RSA_.import_key(data).export_key()
-        except (ValueError, IndexError):
+        except (ValueError, IndexError, TypeError):
             pass
 
         if len(data) < BLOBHEADER.sizeof():
@@ -127,8 +156,15 @@ class RSA:
             return None
 
         obj = BlobTypes[header.bType]()
-        obj.parse(buf)
-        return obj.export_key()
+        # Refuse truncated / malformed BLOBs instead of exporting whatever
+        # fraction of the key material happened to parse.
+        if obj.parse(buf) is None:
+            return None
+
+        try:
+            return obj.export_key()
+        except (ValueError, IndexError, TypeError):
+            return None
 
     @staticmethod
     def export_key(
@@ -138,6 +174,7 @@ class RSA:
         p: Optional[int] = None,
         q: Optional[int] = None,
         crt: Optional[int] = None,
+        consistency_check: bool = False,
     ) -> bytes:
         r"""
         Constructs key from tuple of RSA components
@@ -148,6 +185,8 @@ class RSA:
         :param p: First factor of n
         :param q: Second factor of n
         :param crt: CRT coefficient q
+        :param consistency_check: Verify that the components describe a single
+            mathematically consistent RSA key (used for parsed RSA2 BLOBs)
         :return: RSA key in PEM format
         :rtype: bytes
         """
@@ -158,7 +197,9 @@ class RSA:
         tup = wrap(n), wrap(e), wrap(d), wrap(p), wrap(q), wrap(crt)
         # PyCryptodome accepts only variable-length tuples
         tup_w = tuple(takewhile(lambda x: x is not None, tup))
-        return RSA_.construct(tup_w, consistency_check=False).export_key()  # type: ignore
+        return RSA_.construct(  # type: ignore
+            tup_w, consistency_check=consistency_check
+        ).export_key()
 
 
 rsa = RSA
