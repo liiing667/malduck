@@ -242,6 +242,10 @@ class Extractor:
         Behaves similarly to the @rule-decorated methods but is called for each rule match regardless of
         the rule identifier.
 
+        Final methods are not called when an error occurred during earlier stages of extraction
+        (e.g. a required extractor method raised an exception). This prevents reporting
+        a partial config as a complete family result.
+
         Signature of decorated method:
 
         .. code-block:: Python
@@ -477,12 +481,17 @@ class Extractor:
                 self.on_error(exc, method_name)
 
         # Call final extractors
-        for method_name, method in self._get_methods(FinalExtractorMethod):
-            log.debug("Trying %s.%s (final)", self.__class__.__name__, method_name)
-            try:
-                method(self, p)
-            except Exception as exc:
-                self.on_error(exc, method_name)
+        # but only when no error occurred during extraction. Otherwise
+        # final methods could report partial config as a complete one.
+        if not self.parent.error_occurred:
+            for method_name, method in self._get_methods(FinalExtractorMethod):
+                log.debug(
+                    "Trying %s.%s (final)", self.__class__.__name__, method_name
+                )
+                try:
+                    method(self, p)
+                except Exception as exc:
+                    self.on_error(exc, method_name)
 
     # Extractor method decorators
     @staticmethod

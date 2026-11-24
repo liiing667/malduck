@@ -80,3 +80,55 @@ def test_multirules():
         'matched': ['v2'],
         'third': ['ThIrD string']
     }]
+
+
+class ErrorCatchingManager(ExtractManager):
+    """
+    ExtractManager that collects error evidence instead of just logging it
+    """
+
+    def __init__(self, modules):
+        super().__init__(modules)
+        self.errors = []
+
+    def on_extractor_error(self, exc, extractor, method_name):
+        self.errors.append((extractor.__class__.__name__, method_name, exc))
+
+
+def test_error_shortcircuits_final():
+    modules = ExtractorModules("tests/files/modules")
+    manager = ErrorCatchingManager(modules)
+    # Required (strong) extractor method raises in the middle of extraction
+    assert manager.push_procmem(procmem(b"errfin_boom")) is None
+    # Error evidence is collected and shared within extraction context...
+    assert [
+        (extractor_name, method_name)
+        for extractor_name, method_name, exc in manager.errors
+    ] == [("ErrFin", "boom")]
+    # ...but final methods are short-circuited, so partial config
+    # is not reported as a clean, complete family result
+    assert manager.config == []
+
+
+def test_final_called_without_error():
+    modules = ExtractorModules("tests/files/modules")
+    manager = ErrorCatchingManager(modules)
+    # Independent, legitimate extractor still works (including final methods)
+    assert manager.push_procmem(procmem(b"okfin_trigger")) == "okfin"
+    assert manager.errors == []
+    assert manager.config == [{
+        "family": "okfin",
+        "final": True
+    }]
+
+
+def test_weak_compatible_with_final():
+    modules = ExtractorModules("tests/files/modules")
+    # Weak-only match still doesn't produce config on its own
+    assert not procmem(b"weakfin_weak").extract(modules)
+    # Strong match flushes weak config parts and final methods are called
+    assert procmem(b"weakfin_weak weakfin_strong").extract(modules) == [{
+        "family": "weakfin",
+        "weak": True,
+        "final": True
+    }]

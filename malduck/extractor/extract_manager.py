@@ -232,6 +232,10 @@ class ExtractionContext:
         self.collected_config: Config = {}
         self.globals: Dict[str, Any] = {}
         self.parent = parent  #: Bound ExtractManager instance
+        #: Error occurred during extraction (final extractor methods
+        #: will be skipped, so partial config won't be reported
+        #: as a complete one)
+        self.error_occurred = False
 
     @property
     def family(self) -> Optional[str]:
@@ -251,6 +255,7 @@ class ExtractionContext:
         :param method_name: Name of method which raised the exception
         :type method_name: str
         """
+        self.error_occurred = True
         self.parent.on_extractor_error(exc, extractor, method_name)
 
     def push_procmem(
